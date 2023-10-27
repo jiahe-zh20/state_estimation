@@ -64,11 +64,11 @@ class MeasureEmbedding2(nn.Module):
         self.ts = ts
 
         self.time_embed = nn.ModuleList(nn.Sequential(
-            nn.Conv1d(in_channels=n_nodes, out_channels=n_nodes, kernel_size=11),  # ts -10
+            nn.Conv1d(in_channels=i, out_channels=n_nodes, kernel_size=11),  # ts -10
             nn.ReLU(),
             nn.MaxPool1d(2),  # (ts - 10) / 2
-            nn.Conv1d(in_channels=n_nodes, out_channels=n_nodes, kernel_size=int((ts - 10) / 2 - n_embed + 1)),
-        ) for _ in range(n_meas))
+            nn.Conv1d(in_channels=i, out_channels=n_nodes, kernel_size=int((ts - 10) / 2 - n_embed + 1)),
+        ) for i in n_meas)
         self.spatial_embed = nn.Parameter(torch.FloatTensor(n_embed, n_embed), requires_grad=True)
 
         self.dropout = nn.Dropout(0.1)
@@ -81,8 +81,8 @@ class MeasureEmbedding2(nn.Module):
     def forward(self, x, Z):
         # time embedding
         bsz = x.shape[0]
-        x = x.view(bsz, self.n_meas, self.n_nodes, self.ts)
-        x = [x[:, i, :, :] for i in range(self.n_meas)]
+        meas = [0, self.n_meas]
+        x = [x[:, meas[i]:meas[i+1], :] for i in range(len(self.n_meas) - 1)]
         x = [layer(xp) for layer, xp in zip(self.time_embed, x)]
 
         # spatial embedding
@@ -90,7 +90,7 @@ class MeasureEmbedding2(nn.Module):
         adj = torch.mm(torch.mm(adj, Z), adj)
         x = [F.relu(torch.matmul(xp, self.spatial_embed)) for xp in x]
         x = torch.cat([torch.matmul(adj, xp) for xp in x], dim=1)
-        x = x.view(bsz, self.n_meas * self.n_nodes, self.n_embed)
+        x = x.view(bsz, -1, self.n_embed)
 
         return x
 
@@ -131,7 +131,7 @@ class MultiHeadAttention(nn.Module):
         x = torch.matmul(attention, V)
 
         x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(bsz, -1, self.n_heads * (self.hid_dim // self.n_heads))
+        x = x.view(bsz, -1, self.n_heads * (self.n_embed // self.n_heads))
         out = self.dropout(self.fc(x))
         return x
 
@@ -179,17 +179,23 @@ class BertNet(nn.Module):
         self.Blocks = nn.Sequential(*[Block(configs.n_embed, configs.n_head, configs.ffn_dim, configs.dropout)
                                       for _ in range(configs.n_layers)])
         self.ln = nn.LayerNorm(configs.n_embed)
-        self.proj = nn.ModuleList(nn.Linear(configs.n_embed, 1) for _ in range(configs.n_meas))
+        # self.proj = nn.ModuleList(nn.Linear(configs.n_embed, 1) for _ in range(configs.n_meas))
+        self.proj = nn.ModuleList(nn.Sequential(
+            nn.Conv1d(in_channels=configs.n_nodes, out_channels=i, kernel_size=11),  # n_embed -10
+            nn.ReLU(),
+            nn.MaxPool1d(2),  # (ts - 10) / 2
+            nn.Conv1d(in_channels=configs.n_nodes, out_channels=i, kernel_size=int((configs.n_embed - 10) / 2)),
+        ) for i in configs.n_meas)
 
     def forward(self, x, mask_pos, Z):
         x = self.meas_embed(x, Z)
         attn_mask = get_attn_pad_mask(x)
         x = self.Blocks(x, attn_mask)
 
-        # project
+        # projection
         bsz = x.shape[0]
-        x = x.view(bsz, self.configs.n_meas, self.configs.n_nodes, self.configs.n_embed)
-        x = [x[:, i, :, :] for i in range(self.n_meas)]
+        meas = [0, self.n_meas]
+        x = [x[:, meas[i]:meas[i + 1], :] for i in range(len(self.n_meas) - 1)]
         x = torch.cat([layer(xp) for layer, xp in zip(self.proj, x)], dim=1)
         x = x.view(bsz, self.configs.n_meas * self.configs.n_nodes, 1)
 
